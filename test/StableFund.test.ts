@@ -8,6 +8,7 @@ import {
   utils,
   BigNumberish,
 } from 'ethers';
+
 import UniswapV2Factory from '@uniswap/v2-core/build/UniswapV2Factory.json';
 import UniswapV2Router from '@uniswap/v2-periphery/build/UniswapV2Router02.json';
 import { Provider } from '@ethersproject/providers';
@@ -143,12 +144,13 @@ describe('StableFund', () => {
       105
     );
 
-    await mockdai.connect(operator).mint(operator.address, ETH.mul(20));
-    await mockdai.connect(operator).approve(router.address, ETH.mul(20));
-    await gold.connect(operator).mint(operator.address, ETH.mul(10));
-    await gold.connect(operator).approve(router.address, ETH.mul(10));
+    await mockdai.connect(operator).mint(operator.address, ETH.mul(20000));
+    await mockdai.connect(operator).approve(router.address, ETH.mul(20000));
+    await gold.connect(operator).mint(operator.address, ETH.mul(20));
+    await gold.connect(operator).approve(router.address, ETH.mul(20));
 
-    await addLiquidity(provider, operator, router, gold, mockdai, ETH.mul(10));
+    //console.log("liquidity to uniswap: gold / mockdai ", ETH.mul(2));
+    await addLiquidity(provider, operator, router, gold, mockdai, ETH.mul(20));
  });
 
   describe('seigniorage', () => {
@@ -166,9 +168,9 @@ describe('StableFund', () => {
             const goldPrice = GOLD_PRICE_ONE.mul(80).div(100);
             await oracle.setPrice(goldPrice);
   
-            console.log(goldPrice);
-            await gold.connect(ant).approve(stablefund.address, 7);
-            await stablefund.connect(ant).sellBSGtoStableFund(7);
+            //console.log(goldPrice);
+            await gold.connect(ant).approve(stablefund.address, ETH.mul(7));
+            await stablefund.connect(ant).sellBSGtoStableFund(ETH.mul(7));
   
         });
 
@@ -176,9 +178,12 @@ describe('StableFund', () => {
           const goldPrice = GOLD_PRICE_ONE.mul(95).div(100);
           await oracle.setPrice(goldPrice);
 
-          console.log(goldPrice);
-          await gold.connect(ant).approve(stablefund.address, 7);
-          await stablefund.connect(ant).sellBSGtoStableFund(7);
+          //console.log(goldPrice);
+          await gold.connect(ant).approve(stablefund.address, ETH.mul(7));
+          
+          await expect(stablefund.connect(ant).sellBSGtoStableFund(ETH.mul(7))).to.revertedWith(
+            'StableFund: BSG not eligible for purchase > 90%'
+          );
 
         });
 
@@ -192,8 +197,8 @@ describe('StableFund', () => {
             console.log("sfund dai balance before: ", mockdaiBal);
             console.log("sfund gold balance before: ", goldBal);
         
-            await stablefund.connect(operator).approveUniSwap(gold.address, 4);
-            await stablefund.connect(operator).sellBSGOverPeg(4);
+            await stablefund.connect(operator).approveUniSwap(gold.address, ETH.mul(4));
+            await stablefund.connect(operator).sellBSGOverPeg(ETH.mul(3));
   
             console.log("sfund dai balance after: ", mockdai.balanceOf(stablefund.address));
             console.log("sfund gold balance after: ", gold.balanceOf(stablefund.address));
