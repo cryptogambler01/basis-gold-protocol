@@ -1,205 +1,209 @@
-// SPDX-License-Identifier: MIT
-pragma solidity >=0.6.0;
+import chai, { expect } from 'chai';
+import { ethers } from 'hardhat';
+import { solidity } from 'ethereum-waffle';
+import {
+  Contract,
+  ContractFactory,
+  BigNumber,
+  utils,
+  BigNumberish,
+} from 'ethers';
 
-import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import '@openzeppelin/contracts/token/ERC20/SafeERC20.sol';
-import './interfaces/IOracle.sol';
-import 'hardhat/console.sol';
-import './interfaces/IUniswapV2Pair.sol';
-import './interfaces/IUniswapV2Router02.sol';
+import UniswapV2Factory from '@uniswap/v2-core/build/UniswapV2Factory.json';
+import UniswapV2Router from '@uniswap/v2-periphery/build/UniswapV2Router02.json';
+import { Provider } from '@ethersproject/providers';
+import { SignerWithAddress } from '@nomiclabs/hardhat-ethers/dist/src/signer-with-address';
 
-import './lib/UniswapV2Library.sol';
-import './owner/Operator.sol';
-
-contract StableFund is Ownable, Operator {
-    using SafeERC20 for IERC20;
-    using Address for address;
-    using SafeMath for uint256;
-    
-    IUniswapV2Pair public pair;
-    IERC20 public dai;
-    IERC20 public bsg;
-    address[] public path;
-    IUniswapV2Router02 public router;
-    bool public migrated = false;
-    IOracle public goldOracle;
-    uint256 public goldBuyPercentage = 90e18; //90%
-    uint256 public goldSellPercentage = 105e18; //105%
-    mapping(address => mapping (address => uint256)) allowed;
-    
-    constructor(
-        address _dai,  //DAI
-        address _bsg, //BSG
-        address _factory,
-        address _router,
-        IOracle _goldOracle,
-        uint256 _goldBuyPercentage,
-        uint256 _goldSellPercentage
-        
-    ) public {
-        pair = IUniswapV2Pair(
-            UniswapV2Library.pairFor(_factory, _dai, _bsg)
-        );
-        path = [_dai, _bsg];
-        dai = IERC20(_dai);
-        bsg = IERC20(_bsg);
-        router = IUniswapV2Router02(_router);
-        goldOracle = _goldOracle;
-        goldBuyPercentage = _goldBuyPercentage;
-        goldSellPercentage = _goldSellPercentage;
-    }
-
-    modifier checkMigration {
-        require(!migrated, 'StableFund: migrated');
-        _;
-    }
-
-    //Pricing Functions 
-
-    function getGoldPrice() internal view returns (uint256) {
-        try goldOracle.price1Last() returns (uint256 price) {
-            return price;
-        } catch {
-            revert('StableFund: failed to consult gold price from the oracle');
-        }
-    }
-
-    function getXAUTPrice() internal view returns (uint256) {
-        try goldOracle.price0Last() returns (uint256 price) {
-            return price;
-        } catch {
-            revert('StableFund: failed to consult gold price from the oracle');
-        }
-    }
-
-    // set to 90% of goldOracle Price
-    function goldPriceCeiling() internal view returns(uint256) {
-        uint256 tReturn = goldOracle.goldPriceOne().mul(uint256(goldBuyPercentage)).div(100);
-        //console.log("Price Ceiling: ", tReturn);
-        return tReturn;
-    }
-
-    function goldPriceFloor() internal view returns(uint256) {
-        uint256 tReturn = goldOracle.goldPriceOne().mul(uint256(goldSellPercentage)).div(100);
-        //console.log("Price Floor: ", tReturn);
-        return tReturn;
-    }
-
-    //Selling Functions
-
-    function sellBSGtoStableFund(uint256 numTokens) public checkMigration
-    {
-        require(numTokens > 0, 'Stable FUnd: cannot purchase BSG with zero amount');
-
-        uint256 goldPrice = getGoldPrice();
-        //console.log("GoldPrice: ", goldPrice);
-    
-        require(
-            goldPrice < goldPriceCeiling(),
-            'StableFund: BSG not eligible for purchase > 90%'
-        );
-   
-        require(
-            numTokens.mul(goldPriceCeiling()) < IERC20(dai).balanceOf(address(this)),
-            'StableFund: Not enough DAI for buy'
-        );
-        //console.log("XAUT Price: ", getXAUTPrice().div(1e18));
-        //console.log("gold Price: ", goldPrice);
-        //console.log("Price to Pay: ", 
-        //console.log("GoldCeiling: ", goldPriceCeiling());
-        //console.log("DAI needed: ", numTokens.mul(getXAUTPrice()).mul(goldPriceCeiling()).div(100).div(1e18));
-        //console.log("DAI Balance: ", IERC20(dai).balanceOf(address(this)));
-
-        //Outside my capabilities here lets make sure we test the math...
-        bsg.transferFrom(msg.sender, address(this), numTokens);
-        //console.log("Transfering: ", numTokens.mul(goldOracle.goldPriceOne().div(1e18).mul(90).div(100)));
-        dai.transfer(msg.sender, numTokens.mul(goldOracle.goldPriceOne().div(1e18).mul(90).div(100)));
-        
-        emit StableFundBoughtBSG(msg.sender, numTokens);
-    }
-
-    // Stable Fund selling BSG when above peg. - must call approveUniSwap before calling sellBSGOverPeg
-
-    function approveUniSwap(address token, uint256 numTokens)
-        public
-        checkMigration
-        returns (bool)
-    {
-        if (token == address(dai)) {
-            return dai.approve(address(router), numTokens);
-        } else {
-            require(
-                token == address(bsg),
-                'StableFund: token should match either dai or bsg'
-            );
-            return bsg.approve(address(router), numTokens);
-        }
-    }
-
-    // Can only sell 5 BSG at a time, must have Gold Over 1.05 Peg
-    function sellBSGOverPeg(uint256 numTokens) public  checkMigration 
-    {
-        require(numTokens > 0, 'Stable Fund: cannot sell BSG with zero amount');
-        require(numTokens <= 5, 'Stable Fund: cannot sell more than 5 BSG at a time');
-
-        uint256 goldPrice = getGoldPrice();
-    
-        require(
-            goldPrice > goldPriceFloor(),
-            'StableFund: BSG not eligible for sale < 105%'
-        );
-   
-        require(
-            numTokens <= IERC20(bsg).balanceOf(address(this)),
-            'StableFund: Not enough BSG to sell'
-        );
-
-        uint256 allowance = bsg.allowance(address(this), address(router));
-        require(allowance >= numTokens, "Check the token allowance - Call approveUniSwap");
-
-        uint deadline = block.timestamp + 30;
-
-        //only component that isnt testing in the testing harness.
-        router.swapExactTokensForTokens(
-            numTokens,
-            0,
-            path,
-            address(this),
-            deadline
-        );
-
-        emit StableFundSoldBSG(msg.sender, numTokens);
-    }
+import { advanceTimeAndBlock } from './shared/utilities';
 
 
+chai.use(solidity);
 
-    /* ========== OWNER ========== */
+const MINUTE = 60;
+const DAY = 86400;
+const ETH = utils.parseEther('1');
+const GOLD_PRICE_ONE = utils.parseEther('1850');
+const ZERO = BigNumber.from(0);
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+const INITIAL_BSG_AMOUNT = utils.parseEther('50');
+const INITIAL_BSGS_AMOUNT = utils.parseEther('10000');
+const INITIAL_BSGB_AMOUNT = utils.parseEther('50000');
+const INITIAL_MOCKDAI_AMOUNT = utils.parseEther('92500');
 
-    function setGoldBuyBackPercentage(uint256 _setBSGPercent) public onlyOperator checkMigration {
-        goldBuyPercentage = _setBSGPercent;
-    }
-
-    function setGoldSellPercentage(uint256 _setBSGPercent) public onlyOperator checkMigration {
-        goldSellPercentage = _setBSGPercent;
-    }
-
-    function migrate(address target) public onlyOperator checkMigration {
-        IERC20(dai).transfer(
-            target,
-            IERC20(dai).balanceOf(address(this))
-        );
-
-        IERC20(bsg).transfer(
-            target,
-            IERC20(bsg).balanceOf(address(this))
-        );
-
-        migrated = true;
-        emit Migration(target);
-    }
-
-    event Migration(address indexed target);
-    event StableFundBoughtBSG(address indexed from, uint256 amount);
-    event StableFundSoldBSG(address indexed from, uint256 amount);
-    event Approval(address indexed owner, address indexed spender, uint256 value);
+async function latestBlocktime(provider: Provider): Promise<number> {
+  const { timestamp } = await provider.getBlock('latest');
+  return timestamp;
 }
+
+async function addLiquidity(
+  provider: Provider,
+  operator: SignerWithAddress,
+  router: Contract,
+  tokenA: Contract,
+  tokenB: Contract,
+  amount: BigNumber
+): Promise<void> {
+  await router
+    .connect(operator)
+    .addLiquidity(
+      tokenA.address,
+      tokenB.address,
+      amount,
+      amount,
+      amount,
+      amount,
+      operator.address,
+      (await latestBlocktime(provider)) + 1800
+    );
+}
+
+function bigmin(a: BigNumber, b: BigNumber): BigNumber {
+  return a.lt(b) ? a : b;
+}
+
+describe('StableFund', () => {
+  const { provider } = ethers;
+
+  let operator: SignerWithAddress;
+  let ant: SignerWithAddress;
+
+  before('provider & accounts setting', async () => {
+    [operator, ant] = await ethers.getSigners();
+  });
+
+  // core
+  let Bond: ContractFactory;
+  let Gold: ContractFactory;
+  let Share: ContractFactory;
+  let StableFund: ContractFactory;
+  let Treasury: ContractFactory;
+  let SimpleFund: ContractFactory;
+  let MockDAI: ContractFactory;
+  let MockOracle: ContractFactory;
+  let MockBoardroom: ContractFactory;
+    // uniswap
+    let Factory = new ContractFactory(
+      UniswapV2Factory.abi,
+      UniswapV2Factory.bytecode
+    );
+    let Router = new ContractFactory(
+      UniswapV2Router.abi,
+      UniswapV2Router.bytecode
+    );
+
+  before('fetch contract factories', async () => {
+    Bond = await ethers.getContractFactory('Bond');
+    Gold = await ethers.getContractFactory('Gold');
+    Share = await ethers.getContractFactory('Share');
+    MockDAI = await ethers.getContractFactory('MockDai')
+    Treasury = await ethers.getContractFactory('Treasury');
+    SimpleFund = await ethers.getContractFactory('SimpleERCFund');
+    StableFund = await ethers.getContractFactory('StableFund');
+    MockOracle = await ethers.getContractFactory('MockOracle');
+    MockBoardroom = await ethers.getContractFactory('MockBoardroom');
+  });
+
+  let bond: Contract;
+  let gold: Contract;
+  let share: Contract;
+  let mockdai: Contract;
+  let oracle: Contract;
+  let treasury: Contract;
+  let boardroom: Contract;
+  let fund: Contract;
+  let stablefund: Contract;
+  let startTime: BigNumber;
+  let factory: Contract;
+  let router: Contract;
+
+  before('deploy uniswap', async () => {
+    factory = await Factory.connect(operator).deploy(operator.address);
+    router = await Router.connect(operator).deploy(
+      factory.address,
+      operator.address
+    );
+  });
+
+  beforeEach('deploy contracts', async () => {
+    gold = await Gold.connect(operator).deploy();
+    bond = await Bond.connect(operator).deploy();
+    share = await Share.connect(operator).deploy();
+    mockdai = await MockDAI.connect(operator).deploy();
+    oracle = await MockOracle.connect(operator).deploy();
+    boardroom = await MockBoardroom.connect(operator).deploy(gold.address);
+    fund = await SimpleFund.connect(operator).deploy();
+    startTime = BigNumber.from(await latestBlocktime(provider)).add(DAY);
+
+    stablefund = await StableFund.connect(operator).deploy(
+      mockdai.address,
+      gold.address,
+      factory.address,
+      router.address,
+      oracle.address,
+      90,
+      105
+    );
+
+    await mockdai.connect(operator).mint(operator.address, ETH.mul(20000));
+    await mockdai.connect(operator).approve(router.address, ETH.mul(20000));
+    await gold.connect(operator).mint(operator.address, ETH.mul(20));
+    await gold.connect(operator).approve(router.address, ETH.mul(20));
+
+    //console.log("liquidity to uniswap: gold / mockdai ", ETH.mul(2));
+    await addLiquidity(provider, operator, router, gold, mockdai, ETH.mul(20));
+ });
+
+  describe('seigniorage', () => {
+    describe('#allocateSeigniorage', () => {
+        beforeEach('transfer permissions', async () => {
+            await gold.mint(stablefund.address, INITIAL_BSG_AMOUNT);
+            await mockdai.mint(stablefund.address, INITIAL_MOCKDAI_AMOUNT);
+            await gold.mint(ant.address, INITIAL_BSG_AMOUNT);
+            for await (const contract of [gold, mockdai]) {
+              await contract.connect(operator).transferOperator(stablefund.address);
+            }
+          });
+
+        it('should be able to sellBSGtoStable', async () => {
+            const goldPrice = GOLD_PRICE_ONE.mul(80).div(100);
+            await oracle.setPrice(goldPrice);
+  
+            //console.log(goldPrice);
+            await gold.connect(ant).approve(stablefund.address, ETH.mul(7));
+            await stablefund.connect(ant).sellBSGtoStableFund(ETH.mul(7));
+  
+        });
+
+        it('should fail over 90%, sellBSGtoStable', async () => {
+          const goldPrice = GOLD_PRICE_ONE.mul(95).div(100);
+          await oracle.setPrice(goldPrice);
+
+          //console.log(goldPrice);
+          await gold.connect(ant).approve(stablefund.address, ETH.mul(7));
+          
+          await expect(stablefund.connect(ant).sellBSGtoStableFund(ETH.mul(7))).to.revertedWith(
+            'StableFund: BSG not eligible for purchase > 90%'
+          );
+
+        });
+
+        it('should be able to sellBSGOverPeg', async () => {
+            const goldPrice = GOLD_PRICE_ONE.mul(110).div(100);
+            await oracle.setPrice(goldPrice);
+  
+            console.log("goldprice: ", goldPrice);
+            const mockdaiBal = await mockdai.balanceOf(stablefund.address);
+            const goldBal = await gold.balanceOf(stablefund.address);
+            console.log("sfund dai balance before: ", mockdaiBal);
+            console.log("sfund gold balance before: ", goldBal);
+        
+            await stablefund.connect(operator).approveUniSwap(gold.address, ETH.mul(4));
+            await stablefund.connect(operator).sellBSGOverPeg(ETH.mul(3));
+  
+            console.log("sfund dai balance after: ", mockdai.balanceOf(stablefund.address));
+            console.log("sfund gold balance after: ", gold.balanceOf(stablefund.address));
+          });
+    });
+  });
+
+});
